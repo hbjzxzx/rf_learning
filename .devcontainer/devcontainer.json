@@ -3,6 +3,12 @@
   "features": {
     "ghcr.io/devcontainers/features/conda:1": {
       "addCondaForge": true
+    },
+    "ghcr.io/devcontainers/features/desktop-lite:1": {
+      "webPort": "6080",
+      "vncPort": "5901",
+      "password": "vscode"
     }
-  }
+  },
+  "postCreateCommand": "conda init && conda create rl && conda install swit && conda activate && pip install -r requirements.txt"
 }
