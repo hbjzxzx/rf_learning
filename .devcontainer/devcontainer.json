@@ -10,15 +10,9 @@
       "password": "vscode"
     }
   },
-  "mounts": [],
-  "appPort": ["6080:6080"],
-  "postCreateCommand": ["conda init", 
-  "conda create rl", 
-  "conda install swit",
-  "conda activate", 
-  "pip install -r requirements.txt"],
+  "forwardPorts": [6080],
   "customizations": {
     "vscode": {
-      "extensions": ["vscodevim.vim"]
+      "extensions": ["vscodevim.vim", "ms-python.python", "ms-toolsai.jupyter"]
       }}
 }
