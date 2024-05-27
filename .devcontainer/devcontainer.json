@@ -10,6 +10,7 @@
       "password": "vscode"
     }
   },
+  "mounts": [],
   "appPort": ["6080:6080"],
   "postCreateCommand": ["conda init", 
   "conda create rl", 
