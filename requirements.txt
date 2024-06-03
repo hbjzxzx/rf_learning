@@ -4,5 +4,5 @@ tqdm
 numpy
 matplotlib
 seaborn
-tensorboardX
 tensorboard
+tensorboardX

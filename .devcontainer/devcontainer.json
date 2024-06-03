@@ -8,11 +8,13 @@
       "webPort": "6080",
       "vncPort": "5901",
       "password": "vscode"
-    }
+    },
+    "ghcr.io/devcontainers/features/nvidia-cuda:1": {}
   },
   "forwardPorts": [6080],
   "customizations": {
     "vscode": {
       "extensions": ["vscodevim.vim", "ms-python.python", "ms-toolsai.jupyter"]
-      }}
+      }},
+  "host"
 }
