@@ -16,5 +16,5 @@
     "vscode": {
       "extensions": ["vscodevim.vim", "ms-python.python", "ms-toolsai.jupyter"]
       }},
-  "host"
+  "postCreateCommand": "bash ./init.sh"
 }
