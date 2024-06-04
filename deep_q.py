@@ -8,6 +8,7 @@ from tqdm import tqdm
 from tensorboardX import SummaryWriter
 import torch
 import torch.optim as optim
+import numpy as np
 
 from env import Env 
 
@@ -123,6 +124,23 @@ class ReplayBuffer:
         return zip(*transitions)
 
 
+# 处理连续的Action空间时，有一种简单的方式是将连续的Action空间离散化，即Q网络输出的Action还是离散的，通过转换后，应用到环境中
+# 将离散的Action转换为连续的Action
+class Discrete1ContinuousAction: 
+    def __init__(self, low, high, bins: int, round: int = 1) -> None:
+        self._low = low
+        self._high = high
+        self._bins = bins
+        self._round = round
+
+        self._step = (high - low) / bins
+
+    def to_continuous_action(self, action_of_integer: np.ndarray) -> float:
+        return np.round(
+            self._low + self._step * action_of_integer,
+            self._round
+        )
+
 class DeepQFuncTrainer:
     def __init__(self, q_func: DeepQFunc, 
                  env: Env, 
@@ -131,6 +149,7 @@ class DeepQFuncTrainer:
                  batch_size: int,
                  gamma: float,
                  epsilon_list: List[float],
+                 action_converter: Optional[Discrete1ContinuousAction] = None,
                  logger_folder: Optional[Path] = None,
                  ) -> None:
         self._q_func = copy.deepcopy(q_func)
@@ -143,6 +162,8 @@ class DeepQFuncTrainer:
         self._optimizer = optim.Adam(self._q_func.parameters(), lr=self._learning_rate)
         self._batch_size = batch_size
         self._epsilon_list = epsilon_list
+
+        self._action_convert = action_converter
 
         self._logger_folder = logger_folder if logger_folder is not None else Path('./logs')
 
@@ -167,10 +188,10 @@ class DeepQFuncTrainer:
                 # 使用该策略进行决策, 注意传入的state 需要是torch.tensor类型，并且第一个维度是batch_index
                 with torch.device(self._q_func.get_device()):
                     batched_action = e_greedy_s(torch.tensor([current_state]))
-                action = batched_action.cpu().item()
+                action = batched_action.cpu().item() 
 
                 # 执行这个动作，获取下一个状态      
-                reward, next_state = self._env.step(action)
+                reward, next_state = self._env.step(action if self._action_convert is None else self._action_convert.to_continuous_action(action))
                 acc_reward += reward
 
                 # 将这次的经验存储到经验回放池中 
@@ -222,9 +243,10 @@ class DeepQFuncTrainer:
 
 
 class DeepQFuncTester:
-    def __init__(self, q_func: AbstractQFunc, env: Env) -> None:
+    def __init__(self, q_func: AbstractQFunc, env: Env, action_converter: Optional[Discrete1ContinuousAction] = None) -> None:
         self._q_func = q_func
         self._env = env
+        self._action_converter = action_converter
         
     def test(self, max_step: int):
         init_state = self._env.reset()
@@ -236,7 +258,7 @@ class DeepQFuncTester:
         for _ in range(max_step):
             action = self._q_func.get_optimal_action(torch.tensor([current_state])).item()
             
-            reward, next_state = self._env.step(action)
+            reward, next_state = self._env.step(action if self._action_converter is None else self._action_converter.to_continuous_action(action))
             acc_reward += reward
             reward_list.append(reward)
             current_state = next_state
@@ -246,3 +268,37 @@ class DeepQFuncTester:
         print(f'Test reward: {acc_reward}')
         print(f'Step Rewards: {reward_list}')
     
+
+
+
+# Q Learning 的改进1，Double DQN;
+
+class DoubleQFuncTrainer(DeepQFuncTrainer):
+    def update_q_func(self, update_target_q_func=False):
+        state, action, reward, next_state, weight = self._replay_buffer.sample(self._batch_size)
+        with self._q_func.get_device():
+            state = torch.tensor(state, dtype=torch.float32)
+            action = torch.tensor(action, dtype=torch.int64)
+            reward = torch.tensor(reward, dtype=torch.float32)
+            next_state = torch.tensor(next_state, dtype=torch.float32)
+            weight = torch.tensor(weight, dtype=torch.int)
+        
+        q_values_now_value = self._q_func(state).gather(1, action.unsqueeze(1))
+        q_values_argmax = self._q_func(next_state).argmax(dim=1)
+
+        next_q_values = self._target_q_func(next_state)
+        
+        target_q_values = reward + self._gamma * (next_q_values.gather(1, q_values_argmax.unsqueeze(1))) * weight
+        # target_q_values = target_q_values.detach()
+
+        loss = torch.nn.functional.mse_loss(q_values_now_value, target_q_values.unsqueeze(1))
+
+        self._optimizer.zero_grad()
+        loss.backward()
+        self._optimizer.step()
+
+        # 间隔一定次数，更新一次target_q_func
+        if update_target_q_func:
+            self._target_q_func.load_state_dict(self._q_func.state_dict())
+        
+        
