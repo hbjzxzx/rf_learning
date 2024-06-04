@@ -284,14 +284,15 @@ class DoubleQFuncTrainer(DeepQFuncTrainer):
             weight = torch.tensor(weight, dtype=torch.int)
         
         q_values_now_value = self._q_func(state).gather(1, action.unsqueeze(1))
-        q_values_argmax = self._q_func(next_state).argmax(dim=1)
+        q_values_argmax = torch.argmax(self._q_func(next_state), dim=1)
 
         next_q_values = self._target_q_func(next_state)
         
-        target_q_values = reward + self._gamma * (next_q_values.gather(1, q_values_argmax.unsqueeze(1))) * weight
-        # target_q_values = target_q_values.detach()
+        target_q_values = reward + self._gamma * (next_q_values.gather(1, q_values_argmax.unsqueeze(1))).squeeze() * weight
+        target_q_values = target_q_values.detach()
 
-        loss = torch.nn.functional.mse_loss(q_values_now_value, target_q_values.unsqueeze(1))
+        # print(f'q_values_now_value dim: {q_values_now_value.shape}, target_q_values dim: {target_q_values.shape}')
+        loss = torch.nn.functional.mse_loss(q_values_now_value.squeeze(), target_q_values)
 
         self._optimizer.zero_grad()
         loss.backward()
@@ -301,4 +302,65 @@ class DoubleQFuncTrainer(DeepQFuncTrainer):
         if update_target_q_func:
             self._target_q_func.load_state_dict(self._q_func.state_dict())
         
-        
+
+if __name__ == "__main__":
+    from pathlib import Path
+    import shutil
+
+    import gymnasium as gym
+    import torch
+
+    from env import Env
+
+    GYM_ENV_NAME = 'Pendulum-v1'
+    _train_gym_env = gym.make(GYM_ENV_NAME)
+
+    # 打印查看环境的动作空间和状态空间 
+    action_space, state_space = _train_gym_env.action_space, _train_gym_env.observation_space
+    print(f'action: {action_space}, space: {state_space}')
+
+    BINS = 11
+
+
+    TRAIN_EPOCH = 1000
+    HIDDEN_DIM = 256
+    LEARNING_RATE = 2e-3
+    GAMMA = 0.99
+
+    # 使用指数递减的epsilon-greedy策略
+    START_EPSILON = 0.5
+    END_EPSILON = 0.05
+    DECAY_RATE = 0.99
+    EPSILON_LIST = [max(START_EPSILON * (DECAY_RATE ** i), END_EPSILON) for i in range(TRAIN_EPOCH)]
+
+
+    log_path = Path('./logs/pendulum/run_dqn')
+    if log_path.exists():
+        shutil.rmtree(log_path)
+
+    # _USE_CUDA = True and torch.cuda.is_available()
+    _USE_CUDA = False and torch.cuda.is_available()
+
+    q_func = DeepQFunc(state_space.shape[0], 
+                       BINS, 
+                       hidden_dim=HIDDEN_DIM, 
+                       device=torch.device('cuda') if _USE_CUDA else None)
+
+    env = Env(_train_gym_env)
+
+    replay_buffer = ReplayBuffer(10000)
+    q_func_trainer = DoubleQFuncTrainer(q_func=q_func, 
+                                  env=env,
+                                  replay_buffer=replay_buffer,
+                                  learning_rate=LEARNING_RATE,
+                                  batch_size=64,
+                                  gamma=GAMMA,
+                                  epsilon_list=EPSILON_LIST,
+                                  logger_folder=log_path,
+                                  action_converter=Discrete1ContinuousAction(action_space.low, action_space.high, BINS))
+
+    q_func_trainer.train(train_epoch=TRAIN_EPOCH, 
+                     max_steps=1000, 
+                     minimal_replay_size_to_train=64 * 10,
+                     target_q_update_freq=10)
+    print('done')
