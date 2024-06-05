@@ -1,5 +1,7 @@
 import gymnasium as gym
 from typing import Tuple, Optional, TypeVar
+from pathlib import Path
+import imageio
 
 
 Reward = float
@@ -27,3 +29,10 @@ class Env:
             return cls(gym.make(name))
         else:
             return cls(gym.make(name, render_mode=render_mode))
+
+    
+    def to_gif(self, path: Path, duration: float = 1/30):
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        frames = self._gym_env.render()
+        imageio.mimsave(path, frames, duration=duration, format='.gif')

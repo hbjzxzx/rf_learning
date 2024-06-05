@@ -86,6 +86,7 @@ class DeepQFunc(AbstractQFunc, torch.nn.Module):
         # here use full-connect layer to represent Q function
         self._state_dims = state_dim 
         self._action_nums = action_nums
+        self._hidden_dim = hidden_dim
 
         with torch.device(self.get_device()): 
             self._fc1 = torch.nn.Linear(state_dim, hidden_dim)
@@ -107,10 +108,42 @@ class DeepQFunc(AbstractQFunc, torch.nn.Module):
         return self._action_nums
 
     def save(self, path: Path):
-        torch.save(self.state_dict(), path)
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                'model_state_dict': self.state_dict(),
+                'meta_info': {
+                    'state_dim': self._state_dims,
+                    'action_nums': self._action_nums,
+                    'hidden_dim': self._hidden_dim
+                }
+            }, path)
     
     def load(self, path: Path):
-        self.load_state_dict(torch.load(path))
+        checkpoint = torch.load(path)
+        action_nums = checkpoint['meta_info']['action_nums']
+        state_dim = checkpoint['meta_info']['state_dim']
+        hidden_dim = checkpoint['meta_info']['hidden_dim']
+        weight_state_dict = checkpoint['model_state_dict']
+
+        assert self._action_nums == action_nums and self._state_dims == state_dim and self._hidden_dim == hidden_dim, 'Model structure is not match'
+
+        self._action_nums = action_nums        
+        self._state_dims = state_dim
+        self.load_state_dict(weight_state_dict)
+    
+    @classmethod
+    def from_file(cls, path: Path, device: Optional[torch.device]=None):
+        checkpoint = torch.load(path)
+        action_nums = checkpoint['meta_info']['action_nums']
+        state_dim = checkpoint['meta_info']['state_dim']
+        hidden_dim = checkpoint['meta_info']['hidden_dim']
+        weights = checkpoint['model_state_dict']
+        q_func = cls(state_dim=state_dim,
+                     action_nums=action_nums, hidden_dim=hidden_dim,  device=device)
+        q_func.load_state_dict(weights)
+        return q_func
 
 class ReplayBuffer:
     def __init__(self, capacity: int) -> None:
@@ -121,7 +154,7 @@ class ReplayBuffer:
 
     def sample(self, batch_size):
         transitions = random.sample(self.buffer, batch_size)
-        return zip(*transitions)
+        return map(lambda x: np.array(x), zip(*transitions))
 
 
 # 处理连续的Action空间时，有一种简单的方式是将连续的Action空间离散化，即Q网络输出的Action还是离散的，通过转换后，应用到环境中
@@ -171,49 +204,47 @@ class DeepQFuncTrainer:
               max_steps: int, 
               target_q_update_freq: int,
               minimal_replay_size_to_train: int):
-        writer = SummaryWriter(self._logger_folder)
-        progress_bar = tqdm(range(train_epoch))
+        with SummaryWriter(self._logger_folder) as writer:
+            progress_bar = tqdm(range(train_epoch))
 
-        update_q_index = 1
-        for epoch in progress_bar:
-            init_state = self._env.reset()
-            current_state = init_state
-            acc_reward = 0
-            step_cnt = 0
+            update_q_index = 1
+            for epoch in progress_bar:
+                init_state = self._env.reset()
+                current_state = init_state
+                acc_reward = 0
+                step_cnt = 0
             
-            for _ in range(max_steps):
-                step_cnt += 1
-                # 获取此时DeepQFunc的策略 
-                e_greedy_s = ValueFunc2Strategy.to_strategy_epsilon_greedy(self._q_func, self._epsilon_list[epoch])
-                # 使用该策略进行决策, 注意传入的state 需要是torch.tensor类型，并且第一个维度是batch_index
-                with torch.device(self._q_func.get_device()):
-                    batched_action = e_greedy_s(torch.tensor([current_state]))
-                action = batched_action.cpu().item() 
+                for _ in range(max_steps):
+                    step_cnt += 1
+                    # 获取此时DeepQFunc的策略 
+                    e_greedy_s = ValueFunc2Strategy.to_strategy_epsilon_greedy(self._q_func, self._epsilon_list[epoch])
+                    # 使用该策略进行决策, 注意传入的state 需要是torch.tensor类型，并且第一个维度是batch_index
+                    with torch.device(self._q_func.get_device()):
+                        batched_action = e_greedy_s(torch.tensor(np.array([current_state])))
+                    action = batched_action.cpu().item() 
 
-                # 执行这个动作，获取下一个状态      
-                reward, next_state = self._env.step(action if self._action_convert is None else self._action_convert.to_continuous_action(action))
-                acc_reward += reward
+                    # 执行这个动作，获取下一个状态      
+                    reward, next_state = self._env.step(action if self._action_convert is None else self._action_convert.to_continuous_action(action))
+                    acc_reward += reward
 
-                # 将这次的经验存储到经验回放池中 
-                if next_state is not None:
-                    self._replay_buffer.add(current_state, action, reward, next_state, 1)
-                else:
-                    self._replay_buffer.add(current_state, action, reward, current_state, 0)
+                    # 将这次的经验存储到经验回放池中 
+                    if next_state is not None:
+                        self._replay_buffer.add(current_state, action, reward, next_state, 1)
+                    else:
+                        self._replay_buffer.add(current_state, action, reward, current_state, 0)
 
-                
-                if len(self._replay_buffer.buffer) > minimal_replay_size_to_train:
-                    self.update_q_func(update_q_index % target_q_update_freq == 0)
-                    update_q_index += 1
-                
-                current_state = next_state
-                if current_state is None: 
-                    break
 
-            writer.add_scalar('reward', acc_reward, epoch)
-            writer.add_scalar('step', step_cnt, epoch)
-            progress_bar.set_postfix({'reward': acc_reward, 'step': step_cnt})
-        
-        writer.close() 
+                    if len(self._replay_buffer.buffer) > minimal_replay_size_to_train:
+                        self.update_q_func(update_q_index % target_q_update_freq == 0)
+                        update_q_index += 1
+
+                    current_state = next_state
+                    if current_state is None: 
+                        break
+
+                writer.add_scalar('reward', acc_reward, epoch)
+                writer.add_scalar('step', step_cnt, epoch)
+                progress_bar.set_postfix({'reward': acc_reward, 'step': step_cnt})
 
 
     def update_q_func(self, update_target_q_func=False):
@@ -269,10 +300,7 @@ class DeepQFuncTester:
         print(f'Step Rewards: {reward_list}')
     
 
-
-
 # Q Learning 的改进1，Double DQN;
-
 class DoubleQFuncTrainer(DeepQFuncTrainer):
     def update_q_func(self, update_target_q_func=False):
         state, action, reward, next_state, weight = self._replay_buffer.sample(self._batch_size)
@@ -301,66 +329,70 @@ class DoubleQFuncTrainer(DeepQFuncTrainer):
         # 间隔一定次数，更新一次target_q_func
         if update_target_q_func:
             self._target_q_func.load_state_dict(self._q_func.state_dict())
-        
-
-if __name__ == "__main__":
-    from pathlib import Path
-    import shutil
-
-    import gymnasium as gym
-    import torch
-
-    from env import Env
-
-    GYM_ENV_NAME = 'Pendulum-v1'
-    _train_gym_env = gym.make(GYM_ENV_NAME)
-
-    # 打印查看环境的动作空间和状态空间 
-    action_space, state_space = _train_gym_env.action_space, _train_gym_env.observation_space
-    print(f'action: {action_space}, space: {state_space}')
-
-    BINS = 11
 
 
-    TRAIN_EPOCH = 1000
-    HIDDEN_DIM = 256
-    LEARNING_RATE = 2e-3
-    GAMMA = 0.99
+    
+# if __name__ == "__main__":
+    # q_func = DeepQFunc(4, 2)
+    # q_func.save('mm')
+    # q_func = DeepQFunc.from_file('mm')
 
-    # 使用指数递减的epsilon-greedy策略
-    START_EPSILON = 0.5
-    END_EPSILON = 0.05
-    DECAY_RATE = 0.99
-    EPSILON_LIST = [max(START_EPSILON * (DECAY_RATE ** i), END_EPSILON) for i in range(TRAIN_EPOCH)]
+#     import shutil
+
+#     import gymnasium as gym
+#     import torch
+
+#     from env import Env
+
+#     GYM_ENV_NAME = 'Pendulum-v1'
+#     _train_gym_env = gym.make(GYM_ENV_NAME)
+
+#     # 打印查看环境的动作空间和状态空间 
+#     action_space, state_space = _train_gym_env.action_space, _train_gym_env.observation_space
+#     print(f'action: {action_space}, space: {state_space}')
+
+#     BINS = 11
 
 
-    log_path = Path('./logs/pendulum/run_dqn')
-    if log_path.exists():
-        shutil.rmtree(log_path)
+#     TRAIN_EPOCH = 1000
+#     HIDDEN_DIM = 256
+#     LEARNING_RATE = 2e-3
+#     GAMMA = 0.99
 
-    # _USE_CUDA = True and torch.cuda.is_available()
-    _USE_CUDA = False and torch.cuda.is_available()
+#     # 使用指数递减的epsilon-greedy策略
+#     START_EPSILON = 0.5
+#     END_EPSILON = 0.05
+#     DECAY_RATE = 0.99
+#     EPSILON_LIST = [max(START_EPSILON * (DECAY_RATE ** i), END_EPSILON) for i in range(TRAIN_EPOCH)]
 
-    q_func = DeepQFunc(state_space.shape[0], 
-                       BINS, 
-                       hidden_dim=HIDDEN_DIM, 
-                       device=torch.device('cuda') if _USE_CUDA else None)
 
-    env = Env(_train_gym_env)
+#     log_path = Path('./logs/pendulum/run_dqn')
+#     if log_path.exists():
+#         shutil.rmtree(log_path)
 
-    replay_buffer = ReplayBuffer(10000)
-    q_func_trainer = DoubleQFuncTrainer(q_func=q_func, 
-                                  env=env,
-                                  replay_buffer=replay_buffer,
-                                  learning_rate=LEARNING_RATE,
-                                  batch_size=64,
-                                  gamma=GAMMA,
-                                  epsilon_list=EPSILON_LIST,
-                                  logger_folder=log_path,
-                                  action_converter=Discrete1ContinuousAction(action_space.low, action_space.high, BINS))
+#     # _USE_CUDA = True and torch.cuda.is_available()
+#     _USE_CUDA = False and torch.cuda.is_available()
 
-    q_func_trainer.train(train_epoch=TRAIN_EPOCH, 
-                     max_steps=1000, 
-                     minimal_replay_size_to_train=64 * 10,
-                     target_q_update_freq=10)
-    print('done')
+#     q_func = DeepQFunc(state_space.shape[0], 
+#                        BINS, 
+#                        hidden_dim=HIDDEN_DIM, 
+#                        device=torch.device('cuda') if _USE_CUDA else None)
+
+#     env = Env(_train_gym_env)
+
+#     replay_buffer = ReplayBuffer(10000)
+#     q_func_trainer = DoubleQFuncTrainer(q_func=q_func, 
+#                                   env=env,
+#                                   replay_buffer=replay_buffer,
+#                                   learning_rate=LEARNING_RATE,
+#                                   batch_size=64,
+#                                   gamma=GAMMA,
+#                                   epsilon_list=EPSILON_LIST,
+#                                   logger_folder=log_path,
+#                                   action_converter=Discrete1ContinuousAction(action_space.low, action_space.high, BINS))
+
+#     q_func_trainer.train(train_epoch=TRAIN_EPOCH, 
+#                      max_steps=1000, 
+#                      minimal_replay_size_to_train=64 * 10,
+#                      target_q_update_freq=10)
+#     print('done')
