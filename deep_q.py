@@ -24,6 +24,7 @@ ActionsValueVector = torch.Tensor # one-dimensional tensor, each items is the st
 # 默认都为批处理方式，即无论是State，还是ActionValueVector, 这两个张量的第一个维度我们默认为 batch_index
 BatchedState = torch.Tensor
 BatchedAction = torch.Tensor
+BatchedActionProbVec = torch.Tensor
 BatchedActionsValueVec = torch.Tensor
 
 
@@ -35,7 +36,10 @@ class AbstractQFunc():
     def __init__(self, device: Optional[torch.device]=None) -> None:
         self.__device = torch.device('cpu') if device is None else device
 
-    def get_action_distribute(self, state_batch: BatchedState) -> BatchedActionsValueVec:
+    def get_action_distribute(self, state_batch: BatchedState) -> BatchedActionProbVec:
+        raise NotImplementedError()
+    
+    def get_action_values(self, state_batch: BatchedState) -> BatchedActionsValueVec:
         raise NotImplementedError()
     
     def get_optimal_action(self, state: BatchedState) -> BatchedAction:
@@ -57,14 +61,14 @@ class ValueFunc2Strategy():
 
     @staticmethod
     def to_strategy(f: AbstractQFunc) -> Strategy:
-        def _strategy(s: BatchedState) -> BatchedActionsValueVec: 
-            x = f.get_action_distribute(s).detach()
+        def _strategy(s: BatchedState) -> BatchedAction: 
+            x = f.get_action_values(s).detach().argmax(dim=1)
             return x
         return _strategy
 
     @staticmethod
     def to_strategy_epsilon_greedy(f: AbstractQFunc, epsilon: float) -> Strategy:
-        def _strategy(s: BatchedState) -> BatchedActionsValueVec:
+        def _strategy(s: BatchedState) -> BatchedAction:
             with torch.device(f.get_device()):
                 batch_size = s.size(0)
                 random_choice_action = torch.randint(0, f.get_actions_count(), (batch_size, ))
@@ -96,10 +100,14 @@ class DeepQFunc(AbstractQFunc, torch.nn.Module):
         x = torch.nn.functional.relu(self._fc1(x))
         return self._fc2(x)
         
-    def get_action_distribute(self, state_batch: BatchedState ) -> BatchedActionsValueVec:
+    def get_action_distribute(self, state_batch: BatchedState ) -> BatchedActionProbVec:
         out = self.forward(torch.tensor(state_batch)).detach()
-        return torch.nn.functional.softmax(out, dim=0)
-    
+        return torch.nn.functional.softmax(out, dim=1)
+
+    def get_action_values(self, state_batch: BatchedState) -> BatchedActionsValueVec:
+        out = self.forward(state_batch).detach()
+        return out
+
     def get_optimal_action(self, state_batch: BatchedState) -> BatchedAction:    
         out = self.forward(state_batch)
         return torch.argmax(out, dim=1)
@@ -174,6 +182,28 @@ class Discrete1ContinuousAction:
             self._round
         )
 
+
+class TrainTracerInterface:
+    def before_update_q_func(self, 
+                             epoch: int, 
+                             step: int,
+                             q_func: AbstractQFunc,
+                             current_state: StateVector, 
+                             writer: SummaryWriter):
+        pass 
+
+    def after_update_q_func(self,
+                            epoch: int, 
+                            step: int,
+                            q_func: AbstractQFunc,
+                            current_state: StateVector,
+                            action: Action,
+                            reward: float,
+                            next_state: StateVector,
+                            writer: SummaryWriter):
+        pass
+
+
 class DeepQFuncTrainer:
     def __init__(self, q_func: DeepQFunc, 
                  env: Env, 
@@ -184,6 +214,7 @@ class DeepQFuncTrainer:
                  epsilon_list: List[float],
                  action_converter: Optional[Discrete1ContinuousAction] = None,
                  logger_folder: Optional[Path] = None,
+                 train_tracer: Optional[TrainTracerInterface] = None
                  ) -> None:
         self._q_func = copy.deepcopy(q_func)
         self._target_q_func = q_func
@@ -200,6 +231,8 @@ class DeepQFuncTrainer:
 
         self._logger_folder = logger_folder if logger_folder is not None else Path('./logs')
 
+        self._train_tracer = train_tracer
+
     def train(self, train_epoch: int, 
               max_steps: int, 
               target_q_update_freq: int,
@@ -214,8 +247,12 @@ class DeepQFuncTrainer:
                 acc_reward = 0
                 step_cnt = 0
             
-                for _ in range(max_steps):
+                for step in range(max_steps):
                     step_cnt += 1
+                    # 调用tracer，记录开始的状态
+                    if self._train_tracer is not None: 
+                        self._train_tracer.before_update_q_func(epoch, step, self._q_func, current_state, writer)
+
                     # 获取此时DeepQFunc的策略 
                     e_greedy_s = ValueFunc2Strategy.to_strategy_epsilon_greedy(self._q_func, self._epsilon_list[epoch])
                     # 使用该策略进行决策, 注意传入的state 需要是torch.tensor类型，并且第一个维度是batch_index
@@ -227,6 +264,7 @@ class DeepQFuncTrainer:
                     reward, next_state = self._env.step(action if self._action_convert is None else self._action_convert.to_continuous_action(action))
                     acc_reward += reward
 
+                    
                     # 将这次的经验存储到经验回放池中 
                     if next_state is not None:
                         self._replay_buffer.add(current_state, action, reward, next_state, 1)
@@ -237,6 +275,14 @@ class DeepQFuncTrainer:
                     if len(self._replay_buffer.buffer) > minimal_replay_size_to_train:
                         self.update_q_func(update_q_index % target_q_update_freq == 0)
                         update_q_index += 1
+                    
+                    # 调用tracer，记录更新后的状态
+                    if self._train_tracer is not None: 
+                        self._train_tracer.after_update_q_func(epoch, 
+                                                           step, 
+                                                           self._q_func, 
+                                                           current_state, 
+                                                           action, reward, next_state, writer)
 
                     current_state = next_state
                     if current_state is None: 
@@ -284,10 +330,10 @@ class DeepQFuncTester:
         current_state = init_state
         acc_reward = 0
         reward_list = []
-        # greedy_strategy = to_strategy(self._q_func)
+        greedy_strategy = ValueFunc2Strategy.to_strategy(self._q_func)
 
         for _ in range(max_step):
-            action = self._q_func.get_optimal_action(torch.tensor([current_state])).item()
+            action = greedy_strategy(torch.tensor(np.array([current_state]))).item()
             
             reward, next_state = self._env.step(action if self._action_converter is None else self._action_converter.to_continuous_action(action))
             acc_reward += reward
@@ -330,69 +376,8 @@ class DoubleQFuncTrainer(DeepQFuncTrainer):
         if update_target_q_func:
             self._target_q_func.load_state_dict(self._q_func.state_dict())
 
-
     
 # if __name__ == "__main__":
     # q_func = DeepQFunc(4, 2)
     # q_func.save('mm')
     # q_func = DeepQFunc.from_file('mm')
-
-#     import shutil
-
-#     import gymnasium as gym
-#     import torch
-
-#     from env import Env
-
-#     GYM_ENV_NAME = 'Pendulum-v1'
-#     _train_gym_env = gym.make(GYM_ENV_NAME)
-
-#     # 打印查看环境的动作空间和状态空间 
-#     action_space, state_space = _train_gym_env.action_space, _train_gym_env.observation_space
-#     print(f'action: {action_space}, space: {state_space}')
-
-#     BINS = 11
-
-
-#     TRAIN_EPOCH = 1000
-#     HIDDEN_DIM = 256
-#     LEARNING_RATE = 2e-3
-#     GAMMA = 0.99
-
-#     # 使用指数递减的epsilon-greedy策略
-#     START_EPSILON = 0.5
-#     END_EPSILON = 0.05
-#     DECAY_RATE = 0.99
-#     EPSILON_LIST = [max(START_EPSILON * (DECAY_RATE ** i), END_EPSILON) for i in range(TRAIN_EPOCH)]
-
-
-#     log_path = Path('./logs/pendulum/run_dqn')
-#     if log_path.exists():
-#         shutil.rmtree(log_path)
-
-#     # _USE_CUDA = True and torch.cuda.is_available()
-#     _USE_CUDA = False and torch.cuda.is_available()
-
-#     q_func = DeepQFunc(state_space.shape[0], 
-#                        BINS, 
-#                        hidden_dim=HIDDEN_DIM, 
-#                        device=torch.device('cuda') if _USE_CUDA else None)
-
-#     env = Env(_train_gym_env)
-
-#     replay_buffer = ReplayBuffer(10000)
-#     q_func_trainer = DoubleQFuncTrainer(q_func=q_func, 
-#                                   env=env,
-#                                   replay_buffer=replay_buffer,
-#                                   learning_rate=LEARNING_RATE,
-#                                   batch_size=64,
-#                                   gamma=GAMMA,
-#                                   epsilon_list=EPSILON_LIST,
-#                                   logger_folder=log_path,
-#                                   action_converter=Discrete1ContinuousAction(action_space.low, action_space.high, BINS))
-
-#     q_func_trainer.train(train_epoch=TRAIN_EPOCH, 
-#                      max_steps=1000, 
-#                      minimal_replay_size_to_train=64 * 10,
-#                      target_q_update_freq=10)
-#     print('done')
