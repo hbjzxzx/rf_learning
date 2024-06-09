@@ -83,7 +83,66 @@ class PolicyNetFunc(AbstractQFunc, torch.nn.Module):
         policy_func.load_state_dict(weights)
         return policy_func
 
+
+class ValueNetFunc(torch.nn.Module):
+    def __init__(self, 
+                 state_dim: int,
+                 hidden_dim: int,
+                 device: Optional[torch.device] = None):
+        super().__init__()
+        self._device = device
+
+        self._state_dim = state_dim
+        self._hidden_dim = hidden_dim
+        
+        self._fc1 = torch.nn.Linear(state_dim, hidden_dim)
+        self._fc2 = torch.nn.Linear(hidden_dim, 1)
+        
     
+    def get_device(self) -> torch.device:
+        return self._device
+    
+    def forward(self, x):
+        x = torch.nn.functional.relu(self._fc1(x))
+        return self._fc2(x)
+
+    def save(self, path: Path):    
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        
+        torch.save(
+            {
+                'model_state_dict': self.state_dict(),
+                'meta_info': {
+                    'state_dim': self._state_dim,
+                    'hidden_dim': self._hidden_dim
+                }
+            }, path)
+
+    def load(self, path: Path): 
+        checkpoint = torch.load(path)
+        state_dim = checkpoint['meta_info']['state_dim']
+        hidden_dim = checkpoint['meta_info']['hidden_dim']
+        weight_state_dict = checkpoint['model_state_dict']
+        
+        assert self._state_dim == state_dim and self._hidden_dim == hidden_dim, 'Model structure is not match'
+        
+        self.load_state_dict(weight_state_dict)
+    
+
+    @classmethod
+    def from_file(cls, path: Path, device: Optional[torch.device]=None):
+        checkpoint = torch.load(path)
+        state_dim = checkpoint['meta_info']['state_dim']
+        hidden_dim = checkpoint['meta_info']['hidden_dim']
+        weights = checkpoint['model_state_dict']
+        value_func = cls(state_dim=state_dim, 
+                         hidden_dim=hidden_dim, 
+                         device=device)
+        value_func.load_state_dict(weights)
+        return value_func
+
+
 class PolicyNetTrainer:
     def __init__(self, policy_func: PolicyNetFunc,
                  env: Env,
@@ -184,7 +243,7 @@ class PolicyNetTrainer:
 
             self._optimizer.step()
 
-    
+
 class PolicyNetTester():
     def __init__(self, 
                  policy_fun: AbstractQFunc, 
@@ -217,4 +276,59 @@ class PolicyNetTester():
         
         print(f'Test Reward: {acc_reward}')
         print(f'Step Rewards: {reward_list}')
+
+
+class PolicyValueNetTrainer(PolicyNetTrainer):
+    def __init__(self, policy_func: PolicyNetFunc,
+                 value_func: ValueNetFunc,
+                 env: Env,
+                 learning_rate: float,
+                 gamma: float,
+                 action_converter: Optional[Discrete1ContinuousAction] = None,
+                 logger_folder: Optional[Path] = None,
+                 train_tracer: Optional[TrainTracerInterface] = None,
+                 ) -> None:
+        super().__init__(policy_func, env, learning_rate, gamma, action_converter, logger_folder, train_tracer)
+
+        self._value_func = value_func
+        self._value_optimizer = torch.optim.Adam(self._value_func.parameters(), lr=learning_rate)
+
+    
+    def update(self, trajectory_record_list):
+        states, actions, rewards, next_states = zip(*trajectory_record_list)
+        T = len(states)
+
+        # 这里我们使用向量化的方式来计算
+        with torch.device(self._policy_func.get_device()):
+            self._optimizer.zero_grad()
+
+            batched_rewards = torch.tensor(np.array(rewards), dtype=torch.float)
+            batched_states = torch.tensor(np.array(states), dtype=torch.float)
+            batched_action_choosed = torch.tensor(np.array(actions), dtype=torch.int64)
+
+            # 就算全长gamma 衰减权重
+            full_gamma_weight_vec = torch.pow(
+                torch.full((T,), self._gamma, dtype=torch.float),
+                torch.arange(1, T+1))        
+            # 矩阵的每一个列j, 代表的是从j开始的全长gamma衰减权重
+            full_gamma_weight_matrix = torch.stack(
+                [full_gamma_weight_vec.roll(shift) for shift in range(T)],
+                dim=1
+            )
+            # 使用下三角矩阵处理每一列中多余的位置
+            full_gamma_weight_matrix = torch.tril(full_gamma_weight_matrix)
+            
+            weights_on_prob =batched_rewards.view(1, -1).mm(full_gamma_weight_matrix).squeeze()
+            
+            # 计算每一个状态对应的Action的概率 
+            batched_action_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1))
+            batched_action_log_prob = torch.log(batched_action_prob)
+
+            # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
+
+            loss = (-1 * batched_action_log_prob * weights_on_prob).sum()
+            loss.backward()
+
+            self._optimizer.step()
+            
             
