@@ -83,7 +83,10 @@ class ValueFunc2Strategy():
 
 
 class DeepQFunc(AbstractQFunc, torch.nn.Module):
-    def __init__(self, state_dim: int, action_nums: int, hidden_dim: int = 128, device: Optional[torch.device]=None) -> None:
+    def __init__(self, state_dim: int, 
+                 action_nums: int, 
+                 hidden_dim: int = 128, 
+                 device: Optional[torch.device]=None) -> None:
         AbstractQFunc.__init__(self, device=device) 
         torch.nn.Module.__init__(self)
 
@@ -376,6 +379,33 @@ class DoubleQFuncTrainer(DeepQFuncTrainer):
         if update_target_q_func:
             self._target_q_func.load_state_dict(self._q_func.state_dict())
 
+
+# Q Learning 的改进2，Dueling DQN    
+
+class DuelingQFunc(DeepQFunc):
+    def __init__(self, state_dim: int, 
+                 action_nums: int, 
+                 hidden_dim: int = 128, 
+                 device: torch.device | None = None) -> None:
+        AbstractQFunc.__init__(self, device=device)
+        torch.nn.Module.__init__(self)
+
+        # here use the fc to represent the Q function        
+        self._state_dims = state_dim        
+        self._action_nums = action_nums
+        self._hidden_dim = hidden_dim
+        
+        with torch.device(self.get_device()):
+            self._fc1 = torch.nn.Linear(self._state_dims, self._hidden_dim)
+            self._fc_A = torch.nn.Linear(self._hidden_dim, self._action_nums)
+            self._fc_V = torch.nn.Linear(self._hidden_dim, 1)
+    
+    def forward(self, x):
+        hidden = torch.nn.functional.relu(self._fc1(x))
+        A = self._fc_A(hidden)
+        V = self._fc_V(hidden)
+        Q = V + A - A.mean(dim=1, keepdim=True)
+        return Q
     
 # if __name__ == "__main__":
     # q_func = DeepQFunc(4, 2)
