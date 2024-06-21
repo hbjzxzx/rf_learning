@@ -237,8 +237,8 @@ class PolicyNetTrainer:
             batched_action_log_prob = torch.log(batched_action_prob)
 
             # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
-
-            loss = (-1 * batched_action_log_prob * weights_on_prob).sum()
+            # REIFORCE 还要在梯度前乘以gamma 衰减
+            loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * weights_on_prob).sum()
             loss.backward()
 
             self._optimizer.step()
@@ -324,11 +324,11 @@ class PolicyValueNetTrainer(PolicyNetTrainer):
             batched_action_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1))
             batched_action_log_prob = torch.log(batched_action_prob)
 
-            # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
+            # REIFORCE 还要在梯度前乘以gamma 衰减
 
-            loss = (-1 * batched_action_log_prob * weights_on_prob).sum()
+            # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
+            loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * weights_on_prob).sum()
             loss.backward()
 
             self._optimizer.step()
-            
             
