@@ -83,25 +83,6 @@ class PolicyNetFunc(AbstractQFunc, torch.nn.Module):
         policy_func.load_state_dict(weights)
         return policy_func
 
-
-class ValueNetFunc(torch.nn.Module):
-    def __init__(self, 
-                 state_dim: int,
-                 hidden_dim: int,
-                 device: Optional[torch.device] = None):
-        super().__init__()
-        self._device = device
-
-        self._state_dim = state_dim
-        self._hidden_dim = hidden_dim
-        
-        self._fc1 = torch.nn.Linear(state_dim, hidden_dim)
-        self._fc2 = torch.nn.Linear(hidden_dim, 1)
-        
-    
-    def get_device(self) -> torch.device:
-        return self._device
-    
     def forward(self, x):
         x = torch.nn.functional.relu(self._fc1(x))
         return self._fc2(x)
@@ -184,9 +165,15 @@ class PolicyNetTrainer:
                         action if self._action_converter is None else self._action_converter.to_continuous_action(action)
                         )
                     acc_reward += reward
-                    trajectory_record_list.append(
-                        (current_state, action, reward, next_state)
-                    )
+
+                    if next_state is not None:
+                        trajectory_record_list.append(
+                            (current_state, action, reward, next_state, 1)
+                        )
+                    else:
+                        trajectory_record_list.append(
+                            (current_state, action, reward, next_state, 0)
+                        )
 
                     current_state = next_state
                     
@@ -207,7 +194,7 @@ class PolicyNetTrainer:
                 
     
     def update(self, trajectory_record_list):
-        states, actions, rewards, next_states = zip(*trajectory_record_list)
+        states, actions, rewards, next_states, _ = zip(*trajectory_record_list)
         T = len(states)
 
         # 这里我们使用向量化的方式来计算
@@ -278,6 +265,31 @@ class PolicyNetTester():
         print(f'Step Rewards: {reward_list}')
 
 
+class ValueNetFunc(AbstractQFunc, torch.nn.Module):
+    def __init__(self, 
+                 state_dim: int,
+                 action_nums: int,
+                 hidden_dim: int,
+                 device: Optional[torch.device] = None):
+        AbstractQFunc.__init__(self, device=device)
+        torch.nn.Module.__init__(self) 
+
+        self._state_dim = state_dim
+        self._hidden_dim = hidden_dim
+
+        with self.get_device():        
+            self._fc1 = torch.nn.Linear(state_dim, hidden_dim)
+            self._fc2 = torch.nn.Linear(hidden_dim, action_nums)
+    
+    def forward(self, x):
+        with self.get_device():
+            x = torch.nn.functional.relu(self._fc1(x))
+            return self._fc2(x)
+    
+    def get_values(self, state_batch: BatchedState, action_batch: BatchedAction) -> torch.Tensor:
+        return self.forward(state_batch).gather(1, action_batch)
+    
+
 class PolicyValueNetTrainer(PolicyNetTrainer):
     def __init__(self, policy_func: PolicyNetFunc,
                  value_func: ValueNetFunc,
@@ -295,39 +307,48 @@ class PolicyValueNetTrainer(PolicyNetTrainer):
 
     
     def update(self, trajectory_record_list):
-        states, actions, rewards, next_states = zip(*trajectory_record_list)
+        states, actions, rewards, next_states, next_state_ok = zip(*trajectory_record_list)
         T = len(states)
+
+        # 更新Value Net
+        with torch.device(self._value_func.get_device()):
+
+            value_estimation = self._value_func.forward(batched_states).squeeze()
+            loss = torch.nn.functional.mse_loss(value_estimation, batched_rewards)
+            loss.backward()
+            self._value_optimizer.step()        
 
         # 这里我们使用向量化的方式来计算
         with torch.device(self._policy_func.get_device()):
             self._optimizer.zero_grad()
+            self._value_optimizer.zero_grad()
 
             batched_rewards = torch.tensor(np.array(rewards), dtype=torch.float)
             batched_states = torch.tensor(np.array(states), dtype=torch.float)
             batched_action_choosed = torch.tensor(np.array(actions), dtype=torch.int64)
+            batched_next_is_ok = torch.tensor(np.array(next_state_ok), dtype=torch.int64)
+
+            # TD target:
+            maybe_next_action_prob = self._policy_func.get_action_distribute(next_states)
+            maybe_next_action = torch.distributions.Categorical(maybe_next_action_prob).sample()
+            td_target = batched_rewards + self._gamma * self._value_func.get_values(next_states, maybe_next_action) * batched_next_is_ok
+            now_value_estimated = self._value_func.get_values(batched_states, batched_action_choosed)
+            value_net_loss = torch.nn.functional.mse_loss(now_value_estimated, td_target.detach())
+            value_net_loss.backward()
+            self._value_optimizer.step()
+            
 
             # 就算全长gamma 衰减权重
             full_gamma_weight_vec = torch.pow(
                 torch.full((T,), self._gamma, dtype=torch.float),
                 torch.arange(1, T+1))        
-            # 矩阵的每一个列j, 代表的是从j开始的全长gamma衰减权重
-            full_gamma_weight_matrix = torch.stack(
-                [full_gamma_weight_vec.roll(shift) for shift in range(T)],
-                dim=1
-            )
-            # 使用下三角矩阵处理每一列中多余的位置
-            full_gamma_weight_matrix = torch.tril(full_gamma_weight_matrix)
-            
-            weights_on_prob =batched_rewards.view(1, -1).mm(full_gamma_weight_matrix).squeeze()
-            
+
             # 计算每一个状态对应的Action的概率 
             batched_action_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1))
             batched_action_log_prob = torch.log(batched_action_prob)
 
-            # REIFORCE 还要在梯度前乘以gamma 衰减
-
             # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
-            loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * weights_on_prob).sum()
+            loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * now_value_estimated).sum()
             loss.backward()
 
             self._optimizer.step()
