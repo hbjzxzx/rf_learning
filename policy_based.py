@@ -36,6 +36,8 @@ class PolicyNetFunc(AbstractQFunc, torch.nn.Module):
 
     def get_action_distribute(self, state_batch: BatchedState) -> BatchedActionProbVec:
         x = self.forward(state_batch)
+        assert torch.all(x >= 0), 'Action probability should be positive'
+        assert torch.all(x <= 1), 'Action probability should be less than 1'
         return x
    
     def get_optimal_action(self, state: BatchedState) -> BatchedAction:
@@ -82,46 +84,6 @@ class PolicyNetFunc(AbstractQFunc, torch.nn.Module):
                      action_nums=action_nums, hidden_dim=hidden_dim,  device=device)
         policy_func.load_state_dict(weights)
         return policy_func
-
-    def forward(self, x):
-        x = torch.nn.functional.relu(self._fc1(x))
-        return self._fc2(x)
-
-    def save(self, path: Path):    
-        if not path.parent.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-        
-        torch.save(
-            {
-                'model_state_dict': self.state_dict(),
-                'meta_info': {
-                    'state_dim': self._state_dim,
-                    'hidden_dim': self._hidden_dim
-                }
-            }, path)
-
-    def load(self, path: Path): 
-        checkpoint = torch.load(path)
-        state_dim = checkpoint['meta_info']['state_dim']
-        hidden_dim = checkpoint['meta_info']['hidden_dim']
-        weight_state_dict = checkpoint['model_state_dict']
-        
-        assert self._state_dim == state_dim and self._hidden_dim == hidden_dim, 'Model structure is not match'
-        
-        self.load_state_dict(weight_state_dict)
-    
-
-    @classmethod
-    def from_file(cls, path: Path, device: Optional[torch.device]=None):
-        checkpoint = torch.load(path)
-        state_dim = checkpoint['meta_info']['state_dim']
-        hidden_dim = checkpoint['meta_info']['hidden_dim']
-        weights = checkpoint['model_state_dict']
-        value_func = cls(state_dim=state_dim, 
-                         hidden_dim=hidden_dim, 
-                         device=device)
-        value_func.load_state_dict(weights)
-        return value_func
 
 
 class PolicyNetTrainer:
@@ -172,7 +134,7 @@ class PolicyNetTrainer:
                         )
                     else:
                         trajectory_record_list.append(
-                            (current_state, action, reward, next_state, 0)
+                            (current_state, action, reward, current_state, 0)
                         )
 
                     current_state = next_state
@@ -287,7 +249,7 @@ class ValueNetFunc(AbstractQFunc, torch.nn.Module):
             return self._fc2(x)
     
     def get_values(self, state_batch: BatchedState, action_batch: BatchedAction) -> torch.Tensor:
-        return self.forward(state_batch).gather(1, action_batch)
+        return self.forward(state_batch).gather(1, action_batch.unsqueeze(1))
     
 
 class PolicyValueNetTrainer(PolicyNetTrainer):
@@ -310,14 +272,6 @@ class PolicyValueNetTrainer(PolicyNetTrainer):
         states, actions, rewards, next_states, next_state_ok = zip(*trajectory_record_list)
         T = len(states)
 
-        # 更新Value Net
-        with torch.device(self._value_func.get_device()):
-
-            value_estimation = self._value_func.forward(batched_states).squeeze()
-            loss = torch.nn.functional.mse_loss(value_estimation, batched_rewards)
-            loss.backward()
-            self._value_optimizer.step()        
-
         # 这里我们使用向量化的方式来计算
         with torch.device(self._policy_func.get_device()):
             self._optimizer.zero_grad()
@@ -326,12 +280,13 @@ class PolicyValueNetTrainer(PolicyNetTrainer):
             batched_rewards = torch.tensor(np.array(rewards), dtype=torch.float)
             batched_states = torch.tensor(np.array(states), dtype=torch.float)
             batched_action_choosed = torch.tensor(np.array(actions), dtype=torch.int64)
+            batched_next_state = torch.tensor(np.array(next_states), dtype=torch.float)
             batched_next_is_ok = torch.tensor(np.array(next_state_ok), dtype=torch.int64)
 
             # TD target:
-            maybe_next_action_prob = self._policy_func.get_action_distribute(next_states)
+            maybe_next_action_prob = self._policy_func.get_action_distribute(batched_next_state).detach()
             maybe_next_action = torch.distributions.Categorical(maybe_next_action_prob).sample()
-            td_target = batched_rewards + self._gamma * self._value_func.get_values(next_states, maybe_next_action) * batched_next_is_ok
+            td_target = batched_rewards + self._gamma * self._value_func.get_values(batched_next_state, maybe_next_action) * batched_next_is_ok
             now_value_estimated = self._value_func.get_values(batched_states, batched_action_choosed)
             value_net_loss = torch.nn.functional.mse_loss(now_value_estimated, td_target.detach())
             value_net_loss.backward()
@@ -348,7 +303,7 @@ class PolicyValueNetTrainer(PolicyNetTrainer):
             batched_action_log_prob = torch.log(batched_action_prob)
 
             # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
-            loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * now_value_estimated).sum()
+            loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * now_value_estimated.detach()).sum()
             loss.backward()
 
             self._optimizer.step()

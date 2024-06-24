@@ -32,7 +32,7 @@ BatchedActionsValueVec = torch.Tensor
 Strategy = Callable[[BatchedState], BatchedAction]
 
 
-class AbstractQFunc():
+class AbstractQFunc:
     def __init__(self, device: Optional[torch.device]=None) -> None:
         self.__device = torch.device('cpu') if device is None else device
 
