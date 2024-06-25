@@ -36,8 +36,6 @@ class PolicyNetFunc(AbstractQFunc, torch.nn.Module):
 
     def get_action_distribute(self, state_batch: BatchedState) -> BatchedActionProbVec:
         x = self.forward(state_batch)
-        assert torch.all(x >= 0), 'Action probability should be positive'
-        assert torch.all(x <= 1), 'Action probability should be less than 1'
         return x
    
     def get_optimal_action(self, state: BatchedState) -> BatchedAction:
@@ -85,7 +83,7 @@ class PolicyNetFunc(AbstractQFunc, torch.nn.Module):
         policy_func.load_state_dict(weights)
         return policy_func
 
-
+#  REINFORCE
 class PolicyNetTrainer:
     def __init__(self, policy_func: PolicyNetFunc,
                  env: Env,
@@ -193,6 +191,29 @@ class PolicyNetTrainer:
             self._optimizer.step()
 
 
+class ValueNetFunc(AbstractQFunc, torch.nn.Module):
+    def __init__(self, 
+                 state_dim: int, 
+                 hidden_dim: int,
+                 device: torch.device | None = None) -> None:
+        AbstractQFunc.__init__(self, device=device)
+        torch.nn.Module.__init__(self)
+        
+        self._state_dim = state_dim
+        self._hidden_dim = hidden_dim
+        
+        with self.get_device():
+            self._fc1 = torch.nn.Linear(state_dim, hidden_dim)
+            self._fc2 = torch.nn.Linear(hidden_dim, 1)
+
+    def forward()
+    ...
+
+# REINFORCE with base
+class PolicyNetTrainerWithBase(PolicyNetTrainer):
+    ...
+
+
 class PolicyNetTester():
     def __init__(self, 
                  policy_fun: AbstractQFunc, 
@@ -227,7 +248,7 @@ class PolicyNetTester():
         print(f'Step Rewards: {reward_list}')
 
 
-class ValueNetFunc(AbstractQFunc, torch.nn.Module):
+class ActionStateValueNetFunc(AbstractQFunc, torch.nn.Module):
     def __init__(self, 
                  state_dim: int,
                  action_nums: int,
@@ -249,12 +270,12 @@ class ValueNetFunc(AbstractQFunc, torch.nn.Module):
             return self._fc2(x)
     
     def get_values(self, state_batch: BatchedState, action_batch: BatchedAction) -> torch.Tensor:
-        return self.forward(state_batch).gather(1, action_batch.unsqueeze(1))
+        return self.forward(state_batch).gather(1, action_batch.unsqueeze(1)).squeeze()
     
-
+# Actor-Critic
 class PolicyValueNetTrainer(PolicyNetTrainer):
     def __init__(self, policy_func: PolicyNetFunc,
-                 value_func: ValueNetFunc,
+                 value_func: ActionStateValueNetFunc,
                  env: Env,
                  learning_rate: float,
                  gamma: float,

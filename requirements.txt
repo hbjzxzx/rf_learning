@@ -7,3 +7,4 @@ seaborn
 tensorboard
 tensorboardX
 imageio
+loguru

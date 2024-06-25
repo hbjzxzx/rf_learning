@@ -10,7 +10,7 @@ import torch
 import torch.optim as optim
 import numpy as np
 
-from env import Env 
+from env import Env, Discrete1ContinuousAction
 
 
 # 表示状态特征向量的维度
@@ -166,24 +166,6 @@ class ReplayBuffer:
     def sample(self, batch_size):
         transitions = random.sample(self.buffer, batch_size)
         return map(lambda x: np.array(x), zip(*transitions))
-
-
-# 处理连续的Action空间时，有一种简单的方式是将连续的Action空间离散化，即Q网络输出的Action还是离散的，通过转换后，应用到环境中
-# 将离散的Action转换为连续的Action
-class Discrete1ContinuousAction: 
-    def __init__(self, low, high, bins: int, round: int = 1) -> None:
-        self._low = low
-        self._high = high
-        self._bins = bins
-        self._round = round
-
-        self._step = (high - low) / bins
-
-    def to_continuous_action(self, action_of_integer: np.ndarray) -> float:
-        return np.round(
-            self._low + self._step * action_of_integer,
-            self._round
-        )
 
 
 class TrainTracerInterface:
