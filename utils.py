@@ -25,6 +25,8 @@ logger.configure(handlers=[
     }
 ])
 
+_logger = logger.bind(name='utils')
+
 
 def clear_target_path(p: Path) -> None:
     if p.exists():
@@ -32,6 +34,9 @@ def clear_target_path(p: Path) -> None:
             shutil.rmtree(p)
         else:
             p.unlink()
+    else:
+        _logger.info(f'clear_target_path: {str(p)} dose not exist')
+        
 
 
 def show_gif_on_jupyternb(p: Path) -> None:

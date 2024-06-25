@@ -141,7 +141,7 @@ class PolicyNetTrainer:
                         break
 
                 # start to update the policy net
-                self.update(trajectory_record_list)
+                self.update(trajectory_record_list, writer, epoch)
                 
                 # write the log
                 writer.add_scalar('reward', acc_reward, epoch)
@@ -217,6 +217,7 @@ class PolicyNetTrainerWithBase(PolicyNetTrainer):
     def __init__(self, policy_func: PolicyNetFunc,
                  value_func: ValueNetFunc,
                  env: Env,
+                 value_learning_rate: float,
                  learning_rate: float,
                  gamma: float,
                  action_converter: Optional[Discrete1ContinuousAction] = None,
@@ -225,12 +226,19 @@ class PolicyNetTrainerWithBase(PolicyNetTrainer):
                  ) -> None:
         super().__init__(policy_func, env, learning_rate, gamma, action_converter, logger_folder, train_tracer)
         self._value_func = value_func
-        self._value_optimizer = torch.optim.Adam(self._value_func.parameters(), lr=learning_rate)
+        self._value_optimizer = torch.optim.Adam(self._value_func.parameters(), lr=value_learning_rate)
 
         self._target_value_func = copy.deepcopy(self._value_func).to(self._value_func.get_device())
         self._update_cnt = 1
-    
-    def update(self, trajectory_record_list):
+
+    def _round_update(self, epoch: int) -> str:
+        if epoch % 30 <= 20:
+            return 'value'
+        else:
+            return 'policy'
+            
+
+    def update(self, trajectory_record_list, writer: SummaryWriter, epoch: int):
         states, actions, rewards, next_states, next_state_ok = zip(*trajectory_record_list)
         T = len(states)
 
@@ -245,43 +253,53 @@ class PolicyNetTrainerWithBase(PolicyNetTrainer):
             batched_next_state = torch.tensor(np.array(next_states), dtype=torch.float)
             batched_next_is_ok = torch.tensor(np.array(next_state_ok), dtype=torch.int64) 
 
-            # 更新价值网路            
-            td_now_value = self._value_func.forward(batched_states).squeeze()
-            td_target_value = batched_rewards + self._gamma * self._target_value_func.forward(batched_next_state).squeeze() * batched_next_is_ok
-            value_loss = torch.nn.functional.mse_loss(td_now_value, td_target_value.detach())
-            value_loss.backward()
-            self._value_optimizer.step()
+            # record: action hist
+            writer.add_histogram('action_hist', batched_action_choosed, epoch)
+            writer.add_histogram('rewards', batched_rewards, epoch)
 
-            base_value = td_now_value.detach().squeeze()  
-            if self._update_cnt % 10 == 0:
-                self._target_value_func.load_state_dict(self._value_func.state_dict())
-            self._update_cnt += 1
+            update_target = self._round_update(epoch) 
+            if update_target == 'value':
+                # 更新价值网路            
+                now_estimate_value = self._value_func.forward(batched_states).squeeze()
+                td_target = batched_rewards + self._gamma * self._value_func.forward(batched_next_state).squeeze() * batched_next_is_ok
+                
+                value_loss = 0.5 * torch.nn.functional.mse_loss(td_target, now_estimate_value)
+                value_loss.backward()
 
-            # 就算全长gamma 衰减权重
-            full_gamma_weight_vec = torch.pow(
-                torch.full((T,), self._gamma, dtype=torch.float),
-                torch.arange(1, T+1))        
-            # 矩阵的每一个列j, 代表的是从j开始的全长gamma衰减权重
-            full_gamma_weight_matrix = torch.stack(
-                [full_gamma_weight_vec.roll(shift) for shift in range(T)],
-                dim=1
-            )
-            # 使用下三角矩阵处理每一列中多余的位置
-            full_gamma_weight_matrix = torch.tril(full_gamma_weight_matrix)
+                writer.add_scalar('value_loss', value_loss, epoch)
+                self._value_optimizer.step()
+            else:
+                # 更新策略网络
+
+                # 就算全长gamma 衰减权重
+                full_gamma_weight_vec = torch.pow(
+                    torch.full((T,), self._gamma, dtype=torch.float),
+                    torch.arange(0, T))       
+                # 矩阵的每一个列j, 代表的是从j开始的全长gamma衰减权重
+                full_gamma_weight_matrix = torch.stack(
+                    [full_gamma_weight_vec.roll(shift) for shift in range(T)],
+                    dim=-1
+                )
+                # 使用下三角矩阵处理每一列中多余的位置
+                full_gamma_weight_matrix = torch.tril(full_gamma_weight_matrix)
             
-            decays_return =batched_rewards.view(1, -1).mm(full_gamma_weight_matrix).squeeze()
-            real_weights = decays_return - base_value
+                decays_return =batched_rewards.view(1, -1).mm(full_gamma_weight_matrix).squeeze()
 
-            # 计算每一个状态对应的Action的概率 
-            batched_action_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1))
-            batched_action_log_prob = torch.log(batched_action_prob)
+                now_estimate_value = self._value_func.forward(batched_states).squeeze()
+                real_weights = decays_return - now_estimate_value.detach()
 
-            # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
-            # REIFORCE 还要在梯度前乘以gamma 衰减
-            loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * real_weights).sum()
-            loss.backward()
+                # 计算每一个状态对应的Action的概率 
+                batched_action_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1))
+                batched_action_log_prob = torch.log(batched_action_prob)
 
-            self._optimizer.step() 
+                # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
+                # REIFORCE 还要在梯度前乘以gamma 衰减
+                loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * real_weights).sum()
+                loss.backward()
+
+                writer.add_scalar('policy_target_value', loss, epoch)
+
+                self._optimizer.step() 
 
 
 class PolicyNetTester():
@@ -289,10 +307,12 @@ class PolicyNetTester():
                  policy_fun: AbstractQFunc, 
                  env: Env,
                  action_converter: Optional[Discrete1ContinuousAction] = None,
+                 stochastic: bool = False
                  ):
         self._policy_func = policy_fun
         self._env = env
         self._action_converter = action_converter
+        self._stochastic = stochastic
     
     def test(self, max_step: int):
         init_state = self._env.reset()
@@ -301,7 +321,11 @@ class PolicyNetTester():
         reward_list = []
         
         for _ in range(max_step):
-            action = self._policy_func.get_optimal_action(torch.tensor(np.array([current_state]))).item()
+            if not self._stochastic:
+                action = self._policy_func.get_optimal_action(torch.tensor(np.array([current_state]))).item()
+            else:
+                action_dis = self._policy_func.get_action_distribute(torch.tensor(np.array([current_state])))
+                action = torch.distributions.Categorical(action_dis).sample().item()
             
             reward, next_state = self._env.step(
                  action if self._action_converter is None else self._action_converter.to_continuous_action(action)
