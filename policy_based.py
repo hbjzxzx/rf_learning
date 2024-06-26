@@ -381,7 +381,7 @@ class PolicyValueNetTrainer(PolicyNetTrainer):
         self._value_optimizer = torch.optim.Adam(self._value_func.parameters(), lr=learning_rate)
 
     
-    def update(self, trajectory_record_list):
+    def update(self, trajectory_record_list, writer: SummaryWriter, epoch: int):
         states, actions, rewards, next_states, next_state_ok = zip(*trajectory_record_list)
         T = len(states)
 
