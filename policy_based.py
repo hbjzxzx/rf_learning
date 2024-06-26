@@ -231,12 +231,6 @@ class PolicyNetTrainerWithBase(PolicyNetTrainer):
         self._target_value_func = copy.deepcopy(self._value_func).to(self._value_func.get_device())
         self._update_cnt = 1
 
-    def _round_update(self, epoch: int) -> str:
-        if epoch % 30 <= 20:
-            return 'value'
-        else:
-            return 'policy'
-            
 
     def update(self, trajectory_record_list, writer: SummaryWriter, epoch: int):
         states, actions, rewards, next_states, next_state_ok = zip(*trajectory_record_list)
@@ -257,49 +251,53 @@ class PolicyNetTrainerWithBase(PolicyNetTrainer):
             writer.add_histogram('action_hist', batched_action_choosed, epoch)
             writer.add_histogram('rewards', batched_rewards, epoch)
 
-            update_target = self._round_update(epoch) 
-            if update_target == 'value':
-                # 更新价值网路            
-                now_estimate_value = self._value_func.forward(batched_states).squeeze()
-                td_target = batched_rewards + self._gamma * self._value_func.forward(batched_next_state).squeeze() * batched_next_is_ok
+
+            # 就算全长gamma 衰减权重
+            full_gamma_weight_vec = torch.pow(
+                torch.full((T,), self._gamma, dtype=torch.float),
+                torch.arange(0, T))       
+            # 矩阵的每一个列j, 代表的是从j开始的全长gamma衰减权重
+            full_gamma_weight_matrix = torch.stack(
+                [full_gamma_weight_vec.roll(shift) for shift in range(T)],
+                dim=-1
+            )
+            # 使用下三角矩阵处理每一列中多余的位置
+            full_gamma_weight_matrix = torch.tril(full_gamma_weight_matrix)
+            decays_return =batched_rewards.view(1, -1).mm(full_gamma_weight_matrix).squeeze()
+
+
+            # 更新价值网路            
+
+            # 使用TD 方式更新V
+            # now_estimate_value = self._value_func.forward(batched_states).squeeze()
+            # td_target = batched_rewards + self._gamma * self._value_func.forward(batched_next_state).squeeze() * batched_next_is_ok
                 
-                value_loss = 0.5 * torch.nn.functional.mse_loss(td_target, now_estimate_value)
-                value_loss.backward()
+            # value_loss = 0.5 * torch.nn.functional.mse_loss(td_target, now_estimate_value)
 
-                writer.add_scalar('value_loss', value_loss, epoch)
-                self._value_optimizer.step()
-            else:
-                # 更新策略网络
+            # # 使用回归方式更新V
+            value_loss = torch.nn.functional.mse_loss(decays_return, self._value_func.forward(batched_states).squeeze()) 
+            value_loss.backward()
 
-                # 就算全长gamma 衰减权重
-                full_gamma_weight_vec = torch.pow(
-                    torch.full((T,), self._gamma, dtype=torch.float),
-                    torch.arange(0, T))       
-                # 矩阵的每一个列j, 代表的是从j开始的全长gamma衰减权重
-                full_gamma_weight_matrix = torch.stack(
-                    [full_gamma_weight_vec.roll(shift) for shift in range(T)],
-                    dim=-1
-                )
-                # 使用下三角矩阵处理每一列中多余的位置
-                full_gamma_weight_matrix = torch.tril(full_gamma_weight_matrix)
-            
-                decays_return =batched_rewards.view(1, -1).mm(full_gamma_weight_matrix).squeeze()
+            writer.add_scalar('value_loss', value_loss, epoch)
+            self._value_optimizer.step()
 
-                now_estimate_value = self._value_func.forward(batched_states).squeeze()
-                real_weights = decays_return - now_estimate_value.detach()
+            # 更新策略网络
 
-                # 计算每一个状态对应的Action的概率 
-                batched_action_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1))
-                batched_action_log_prob = torch.log(batched_action_prob)
+            now_estimate_value = self._value_func.forward(batched_states).squeeze()
+            real_weights = decays_return - now_estimate_value.detach()
 
-                # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
-                # REIFORCE 还要在梯度前乘以gamma 衰减
-                loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * real_weights).sum()
-                loss.backward()
+            # 计算每一个状态对应的Action的概率 
+            batched_action_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1))
+            batched_action_log_prob = torch.log(batched_action_prob)
 
-                writer.add_scalar('policy_target_value', loss, epoch)
+            # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
+            # REIFORCE 还要在梯度前乘以gamma 衰减
+            loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * real_weights).sum()
+            loss.backward()
 
-                self._optimizer.step() 
+            writer.add_scalar('policy_target_value', loss, epoch)
+
+            self._optimizer.step() 
 
 
 class PolicyNetTester():
