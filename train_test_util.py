@@ -1,13 +1,15 @@
 from pathlib import Path
 import datetime
-from typing import Any
-
-from utils import clear_target_path
-from loguru import logger
+from typing import Any, Optional
 from dataclasses import dataclass
 
+from tqdm import tqdm
+
 from env import Env
-from utils import show_gif_on_jupyternb, to_gif
+from utils import show_gif_on_jupyternb, to_gif, get_logger, clear_target_path
+
+
+_logger = get_logger(name='train_test_util')
 
 
 @dataclass
@@ -25,24 +27,35 @@ class StandarTestProcess:
     model: Any
     tester: Any
     env: Env
-    test_output_path: Path 
+    test_output_path: Optional[Path] = None
 
     test_epoch: int = 1
+    show_result: bool = True
 
 
 def start_test(test_process: StandarTestProcess) -> None:
-    test_output_path = test_process.test_output_path
+    if test_process.show_result:
+        _logger.warning('show_result is True, this will slow down the test process and only test 1 epoch')
+        test_process.test_epoch = 1
 
-    RESULT_GIF = test_output_path / 'result.gif'
-    clear_target_path(RESULT_GIF)
-    test_process.tester.test(1000)
-
-    to_gif(test_process.env._gym_env, RESULT_GIF, 1/30)
-    show_gif_on_jupyternb(RESULT_GIF)
+    reward_lst = [] 
+    _logger.info(f'start testing, now datetime: {datetime.datetime.now()}, test_epoch: {test_process.test_epoch}')
+    for e in tqdm(range(test_process.test_epoch), unit='epoch'):
+        reward, _ = test_process.tester.test(1000)
+        reward_lst.append(reward) 
+    _logger.info(f'end testing, now datetime: {datetime.datetime.now()}') 
+    
+    if test_process.show_result:
+        test_output_path = test_process.test_output_path
+        RESULT_GIF = test_output_path / 'result.gif'
+        clear_target_path(RESULT_GIF)
+        to_gif(test_process.env._gym_env, RESULT_GIF, 1/30)
+        show_gif_on_jupyternb(RESULT_GIF)
+    
+    return sum(reward_lst) / len(reward_lst)
 
 
 def start_train(train_process: StandarTrainProcess) -> None:
-    _logger = logger.bind(name='train_test_util')
 
     log_path = train_process.log_path 
     model_path = train_process.model_path

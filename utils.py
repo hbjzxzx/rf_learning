@@ -2,6 +2,7 @@ from pathlib import Path
 import shutil
 import sys
 import traceback
+import logging
 
 import gymnasium as gym
 import imageio
@@ -27,6 +28,9 @@ logger.configure(handlers=[
 
 _logger = logger.bind(name='utils')
 
+
+def get_logger(name: str)-> logging.Logger:
+    return logger.bind(name=name)
 
 def clear_target_path(p: Path) -> None:
     if p.exists():

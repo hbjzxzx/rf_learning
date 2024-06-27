@@ -1,6 +1,6 @@
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 from itertools import count
 import copy
 
@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from deep_q import AbstractQFunc, BatchedAction, BatchedActionProbVec, BatchedState, Discrete1ContinuousAction, TrainTracerInterface
 from env import Env
-
+from utils import get_logger
 
 class PolicyNetFunc(AbstractQFunc, torch.nn.Module):
     def __init__(self, state_dim: int, 
@@ -83,6 +83,7 @@ class PolicyNetFunc(AbstractQFunc, torch.nn.Module):
         policy_func.load_state_dict(weights)
         return policy_func
 
+EpochEndCallback = Callable[[int, float, PolicyNetFunc], bool]
 #  REINFORCE
 class PolicyNetTrainer:
     def __init__(self, policy_func: PolicyNetFunc,
@@ -92,6 +93,7 @@ class PolicyNetTrainer:
                  action_converter: Optional[Discrete1ContinuousAction] = None,
                  logger_folder: Optional[Path] = None,
                  train_tracer: Optional[TrainTracerInterface] = None,
+                 epoch_end_callback: Optional[EpochEndCallback] = None
                  ) -> None:
         self._policy_func = policy_func
         self._env = env
@@ -103,6 +105,7 @@ class PolicyNetTrainer:
         self._action_converter = action_converter
         self._logger_folder = logger_folder if logger_folder is not None else Path('./logs')
         self._train_tracer = train_tracer
+        self._epoch_end_callback = epoch_end_callback
     
     def train(self, train_epoch: int):
         with SummaryWriter(self._logger_folder) as writer:
@@ -151,6 +154,8 @@ class PolicyNetTrainer:
                     'reward': f'{acc_reward:.2f}',
                     'step': f'{acc_step_cnt}'
                 })
+                if self._epoch_end_callback is not None:
+                    self._epoch_end_callback(epoch, acc_reward, self._policy_func)
                 
     
     def update(self, trajectory_record_list):
@@ -209,7 +214,6 @@ class ValueNetFunc(AbstractQFunc, torch.nn.Module):
     def forward(self, x):
         x = torch.nn.functional.relu(self._fc1(x))
         return self._fc2(x)
-    
 
 
 # REINFORCE with base
@@ -311,13 +315,14 @@ class PolicyNetTester():
         self._env = env
         self._action_converter = action_converter
         self._stochastic = stochastic
+        self._logger = get_logger('PolicyNetTester')
     
     def test(self, max_step: int):
         init_state = self._env.reset()
         current_state = init_state
         acc_reward = 0
         reward_list = []
-        
+
         for _ in range(max_step):
             if not self._stochastic:
                 action = self._policy_func.get_optimal_action(torch.tensor(np.array([current_state]))).item()
@@ -336,8 +341,7 @@ class PolicyNetTester():
             if current_state is None:
                 break
         
-        print(f'Test Reward: {acc_reward}')
-        print(f'Step Rewards: {reward_list}')
+        return acc_reward, reward_list
 
 
 class ActionStateValueNetFunc(AbstractQFunc, torch.nn.Module):
@@ -370,15 +374,19 @@ class PolicyValueNetTrainer(PolicyNetTrainer):
                  value_func: ActionStateValueNetFunc,
                  env: Env,
                  learning_rate: float,
+                 vlearning_rate: float,
                  gamma: float,
                  action_converter: Optional[Discrete1ContinuousAction] = None,
                  logger_folder: Optional[Path] = None,
                  train_tracer: Optional[TrainTracerInterface] = None,
+                 epoch_end_callback: Optional[EpochEndCallback] = None
                  ) -> None:
-        super().__init__(policy_func, env, learning_rate, gamma, action_converter, logger_folder, train_tracer)
+        super().__init__(policy_func, env, learning_rate, gamma, action_converter, logger_folder, train_tracer,
+                         epoch_end_callback=epoch_end_callback)
 
         self._value_func = value_func
-        self._value_optimizer = torch.optim.Adam(self._value_func.parameters(), lr=learning_rate)
+        self._value_optimizer = torch.optim.Adam(self._value_func.parameters(), lr=vlearning_rate)
+        self._target_func = copy.deepcopy(value_func)
 
     
     def update(self, trajectory_record_list, writer: SummaryWriter, epoch: int):
@@ -399,17 +407,20 @@ class PolicyValueNetTrainer(PolicyNetTrainer):
             # TD target:
             maybe_next_action_prob = self._policy_func.get_action_distribute(batched_next_state).detach()
             maybe_next_action = torch.distributions.Categorical(maybe_next_action_prob).sample()
-            td_target = batched_rewards + self._gamma * self._value_func.get_values(batched_next_state, maybe_next_action) * batched_next_is_ok
+            td_target = batched_rewards + self._gamma * self._target_func.get_values(batched_next_state, maybe_next_action) * batched_next_is_ok
             now_value_estimated = self._value_func.get_values(batched_states, batched_action_choosed)
             value_net_loss = torch.nn.functional.mse_loss(now_value_estimated, td_target.detach())
             value_net_loss.backward()
-            self._value_optimizer.step()
             
+            writer.add_scalar('critic net loss', value_net_loss, epoch)
+            self._value_optimizer.step()
+            if epoch % 10 == 9:
+                self._target_func.load_state_dict(self._value_func.state_dict()) 
 
             # 就算全长gamma 衰减权重
             full_gamma_weight_vec = torch.pow(
                 torch.full((T,), self._gamma, dtype=torch.float),
-                torch.arange(1, T+1))        
+                torch.arange(0, T))        
 
             # 计算每一个状态对应的Action的概率 
             batched_action_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1))
@@ -418,6 +429,7 @@ class PolicyValueNetTrainer(PolicyNetTrainer):
             # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
             loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * now_value_estimated.detach()).sum()
             loss.backward()
-
+            
+            writer.add_scalar('policy net loss', loss, epoch)
             self._optimizer.step()
             
