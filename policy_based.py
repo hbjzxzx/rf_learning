@@ -433,3 +433,137 @@ class PolicyValueNetTrainer(PolicyNetTrainer):
             writer.add_scalar('policy net loss', loss, epoch)
             self._optimizer.step()
             
+
+# TRPO
+class PolicyNetTrainerWithTRPO(PolicyNetTrainer):
+    def __init__(self, policy_func: PolicyNetFunc,
+                 value_func: ValueNetFunc,
+                 env: Env,
+                 value_learning_rate: float,
+                 learning_rate: float,
+                 gamma: float,
+                 kl_threadhold: float,
+                 search_alpha: float,
+                 action_converter: Optional[Discrete1ContinuousAction] = None,
+                 logger_folder: Optional[Path] = None,
+                 train_tracer: Optional[TrainTracerInterface] = None,
+                 ) -> None:
+        super().__init__(policy_func, env, learning_rate, gamma, action_converter, logger_folder, train_tracer)
+        self._value_func = value_func
+        self._value_optimizer = torch.optim.Adam(self._value_func.parameters(), lr=value_learning_rate)
+
+        self._target_value_func = copy.deepcopy(self._value_func).to(self._value_func.get_device())
+        self._update_cnt = 1
+
+        self._kl_threadhold = kl_threadhold
+        self._search_alpha = search_alpha
+
+    def update(self, trajectory_record_list, writer: SummaryWriter, epoch: int):
+        with torch.device(self._policy_func.get_device()):
+            self._update_with_trpo(trajectory_record_list, writer, epoch)
+
+    def _update(self, trajectory_record_list, writer: SummaryWriter, epoch: int):
+        states, actions, rewards, next_states, next_state_ok = zip(*trajectory_record_list)
+        T = len(states)
+
+        with torch.device(self._policy_func.get_device()):
+            self._optimizer.zero_grad()
+            self._value_optimizer.zero_grad()
+
+            batched_rewards = torch.tensor(np.array(rewards), dtype=torch.float)
+            batched_states = torch.tensor(np.array(states), dtype=torch.float)
+            batched_action_choosed = torch.tensor(np.array(actions), dtype=torch.int64)
+            batched_next_state = torch.tensor(np.array(next_states), dtype=torch.float)
+            batched_next_is_ok = torch.tensor(np.array(next_state_ok), dtype=torch.int64) 
+
+            # record: action hist
+            writer.add_histogram('action_hist', batched_action_choosed, epoch)
+            writer.add_histogram('rewards', batched_rewards, epoch)
+
+
+            # 就算全长gamma 衰减权重
+            full_gamma_weight_vec = torch.pow(
+                torch.full((T,), self._gamma, dtype=torch.float),
+                torch.arange(0, T))       
+            # 矩阵的每一个列j, 代表的是从j开始的全长gamma衰减权重
+            full_gamma_weight_matrix = torch.stack(
+                [full_gamma_weight_vec.roll(shift) for shift in range(T)],
+                dim=-1
+            )
+            # 使用下三角矩阵处理每一列中多余的位置
+            full_gamma_weight_matrix = torch.tril(full_gamma_weight_matrix)
+            decays_return =batched_rewards.view(1, -1).mm(full_gamma_weight_matrix).squeeze()
+
+
+            # 更新价值网路            
+
+            # 使用TD 方式更新V
+            # now_estimate_value = self._value_func.forward(batched_states).squeeze()
+            # td_target = batched_rewards + self._gamma * self._value_func.forward(batched_next_state).squeeze() * batched_next_is_ok
+                
+            # value_loss = 0.5 * torch.nn.functional.mse_loss(td_target, now_estimate_value)
+
+            # # 使用回归方式更新V
+            value_loss = torch.nn.functional.mse_loss(decays_return, self._value_func.forward(batched_states).squeeze()) 
+            value_loss.backward()
+
+            writer.add_scalar('value_loss', value_loss, epoch)
+            self._value_optimizer.step()
+
+            # 更新策略网络
+
+            now_estimate_value = self._value_func.forward(batched_states).squeeze()
+            real_weights = decays_return - now_estimate_value.detach()
+
+            # 计算每一个状态对应的Action的概率 
+            batched_action_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1))
+            batched_action_log_prob = torch.log(batched_action_prob)
+
+            # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
+            # REIFORCE 还要在梯度前乘以gamma 衰减
+            loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * real_weights).sum()
+            loss.backward()
+
+            writer.add_scalar('policy_target_value', loss, epoch)
+
+            self._optimizer.step() 
+
+    def _update_with_trpo(self, trajectory_record_list, writer: SummaryWriter, epoch: int):
+        states, actions, rewards, next_states, next_state_ok = zip(*trajectory_record_list)
+        T = len(states)
+
+        batched_rewards = torch.tensor(np.array(rewards), dtype=torch.float)
+        batched_states = torch.tensor(np.array(states), dtype=torch.float)
+        batched_action_choosed = torch.tensor(np.array(actions), dtype=torch.int64)
+        batched_next_state = torch.tensor(np.array(next_states), dtype=torch.float)
+        batched_next_is_ok = torch.tensor(np.array(next_state_ok), dtype=torch.int64) 
+
+        # record: action hist
+        writer.add_histogram('action_hist', batched_action_choosed, epoch)
+        writer.add_histogram('rewards', batched_rewards, epoch)
+
+        # 计算gamma衰减的权重
+            # 就算全长gamma 衰减权重
+        full_gamma_weight_vec = torch.pow(
+                torch.full((T,), self._gamma, dtype=torch.float),
+                torch.arange(0, T))       
+            # 矩阵的每一个列j, 代表的是从j开始的全长gamma衰减权重
+        full_gamma_weight_matrix = torch.stack(
+                [full_gamma_weight_vec.roll(shift) for shift in range(T)],
+                dim=-1
+            )
+            # 使用下三角矩阵处理每一列中多余的位置
+        full_gamma_weight_matrix = torch.tril(full_gamma_weight_matrix)
+        decays_return =batched_rewards.view(1, -1).mm(full_gamma_weight_matrix).squeeze()
+
+
+        old_action_choosed_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1)).suqeeze()
+        old_action_dist = torch.distributions.Categorical(self._policy_func.get_action_distribute(batched_states))
+
+        # 由于这里用了简单的FC 作为policy，因此概率比值那一项恒为1.
+        surrogate_obj = torch.mean(decays_return)
+        
+        # 计算此时的梯度向量 g
+
+        # 使用共轭梯度计算 x = H^-1 * g
+        
