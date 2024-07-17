@@ -79,7 +79,7 @@ def objective(trial: optuna.Trial):
     
     avg_reward = start_test(
         StandarTestProcess(
-            model=policy_func,
+            model=policy_func.to('cpu'),
             tester=policy_func_tester,
             env=env,
             test_epoch=100,
@@ -114,4 +114,4 @@ if __name__ == '__main__':
     # 使用组合剪枝器
     pruner = CombinedPruner(custom_threshold=80)
     study = optuna.create_study(direction='maximize', pruner=pruner, storage='sqlite:///example_study.db')
-    study.optimize(objective, n_trials=100, n_jobs=8)
+    study.optimize(objective, n_trials=100, n_jobs=4)

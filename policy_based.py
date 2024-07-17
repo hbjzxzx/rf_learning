@@ -28,7 +28,22 @@ class PolicyNetFunc(AbstractQFunc, torch.nn.Module):
         with self.get_device():
             self._fc1 = torch.nn.Linear(state_dim, hidden_dim)
             self._fc2 = torch.nn.Linear(hidden_dim, action_nums)
-    
+   
+    def __deepcopy__(self, memo):
+        # Create a new instance of the class
+        new_copy = type(self)(
+            self._state_dims, 
+            self._action_nums, 
+            self._hidden_dim, 
+            self.get_device()
+        )
+        
+        # Deep copy the attributes
+        new_copy._fc1 = copy.deepcopy(self._fc1, memo)
+        new_copy._fc2 = copy.deepcopy(self._fc2, memo)
+        
+        return new_copy 
+
     def forward(self, x):
         x = torch.nn.functional.relu(self._fc1(x))
         x = torch.nn.functional.softmax(self._fc2(x), dim=1)
@@ -462,71 +477,88 @@ class PolicyNetTrainerWithTRPO(PolicyNetTrainer):
         with torch.device(self._policy_func.get_device()):
             self._update_with_trpo(trajectory_record_list, writer, epoch)
 
-    def _update(self, trajectory_record_list, writer: SummaryWriter, epoch: int):
-        states, actions, rewards, next_states, next_state_ok = zip(*trajectory_record_list)
-        T = len(states)
-
-        with torch.device(self._policy_func.get_device()):
-            self._optimizer.zero_grad()
-            self._value_optimizer.zero_grad()
-
-            batched_rewards = torch.tensor(np.array(rewards), dtype=torch.float)
-            batched_states = torch.tensor(np.array(states), dtype=torch.float)
-            batched_action_choosed = torch.tensor(np.array(actions), dtype=torch.int64)
-            batched_next_state = torch.tensor(np.array(next_states), dtype=torch.float)
-            batched_next_is_ok = torch.tensor(np.array(next_state_ok), dtype=torch.int64) 
-
-            # record: action hist
-            writer.add_histogram('action_hist', batched_action_choosed, epoch)
-            writer.add_histogram('rewards', batched_rewards, epoch)
-
-
-            # 就算全长gamma 衰减权重
-            full_gamma_weight_vec = torch.pow(
-                torch.full((T,), self._gamma, dtype=torch.float),
-                torch.arange(0, T))       
-            # 矩阵的每一个列j, 代表的是从j开始的全长gamma衰减权重
-            full_gamma_weight_matrix = torch.stack(
-                [full_gamma_weight_vec.roll(shift) for shift in range(T)],
-                dim=-1
+    
+    def _compute_surrogate_obj(self, 
+                               batched_state, 
+                               batched_action, 
+                               batched_weights,
+                               old_policy,
+                               new_policy): 
+        old_log_prob = torch.log(old_policy(batched_state).gather(1, batched_action.view(-1, 1)))
+        new_log_prob = torch.log(new_policy(batched_state).gather(1, batched_action.view(-1, 1)))
+        return torch.mean(
+            batched_weights * (old_log_prob - new_log_prob)
+        )
+    
+    def _hessian_vector_product(self, batched_states, 
+                                old_policy: torch.nn.Module, 
+                                new_policy: torch.nn.Module, 
+                                vector: torch.Tensor):
+        kl_divergence = torch.mean(
+            torch.distributions.kl.kl_divergence(
+                torch.distributions.Categorical(old_policy(batched_states)),
+                torch.distributions.Categorical(new_policy(batched_states))
             )
-            # 使用下三角矩阵处理每一列中多余的位置
-            full_gamma_weight_matrix = torch.tril(full_gamma_weight_matrix)
-            decays_return =batched_rewards.view(1, -1).mm(full_gamma_weight_matrix).squeeze()
+        )
+        print('kl_divergence is: ', kl_divergence)
+        kl_grad = torch.autograd.grad(kl_divergence, old_policy.parameters() , create_graph=True)
+        kl_grad_vector = torch.cat([grad.view(-1) for grad in kl_grad])
+        print('kl_grad_vector is: ', kl_grad_vector)
+        kl_grad_vector_product = kl_grad_vector.dot(vector) 
+        grad2 = torch.autograd.grad(kl_grad_vector_product, old_policy.parameters())
+        grad2_vector = torch.cat([grad.view(-1) for grad in grad2])
+
+        return grad2_vector
+        
+    def _conjugate_gradient(self, grad, state, old_policy, new_policy):
+        x = torch.zeros_like(grad)
+        print('x ini: : ', x)
+        r = grad.clone()
+        p = grad.clone()
+        rdotr = r.dot(r)
+        for i in range(10):
+            hp = self._hessian_vector_product(state, old_policy, new_policy, p)
+            print(f'hp at {i} is: ', hp)
+            alpha = rdotr / p.dot(hp)
+            x += alpha * p
+            print(f'x at {i} is: ', x)
+            r -= alpha * hp
+            new_rdotr = r.dot(r)
+            if new_rdotr < 1e-10:
+                break
+            beta = new_rdotr / rdotr
+            p = r + beta * p
+        print('x finally: : ', x)
+        return x
 
 
-            # 更新价值网路            
-
-            # 使用TD 方式更新V
-            # now_estimate_value = self._value_func.forward(batched_states).squeeze()
-            # td_target = batched_rewards + self._gamma * self._value_func.forward(batched_next_state).squeeze() * batched_next_is_ok
+    def _linear_search(self, batched_states, batched_action, weights, old_policy: PolicyNetFunc, descent_dir):
+        old_obj = self._compute_surrogate_obj(batched_states, batched_action, weights, old_policy, old_policy)
+        old_params = torch.nn.utils.convert_parameters.parameters_to_vector(old_policy.parameters())
                 
-            # value_loss = 0.5 * torch.nn.functional.mse_loss(td_target, now_estimate_value)
+        for i in range(15):
+            coef = self._search_alpha ** i
+            new_params = old_params + coef * descent_dir
+            new_actor = copy.deepcopy(old_policy)
+            torch.nn.utils.convert_parameters.vector_to_parameters(new_params, new_actor.parameters())
+            print('coef is: ', coef)
+            print('descent is: ', descent_dir)
+            x = new_actor.get_action_distribute(batched_states)
+            print(x)
+            y = old_policy.get_action_distribute(batched_states)
+            print('y is: ', y)
+            new_action_dist = torch.distributions.Categorical(x)
+            kl_divergence = torch.mean(
+                torch.distributions.kl.kl_divergence(
+                    torch.distributions.Categorical(old_policy(batched_states)),
+                    new_action_dist
+                )
+            )
+            new_obj = self._compute_surrogate_obj(batched_states, batched_action, weights, old_policy, new_actor)
+            if new_obj > old_obj and kl_divergence < self._kl_threadhold:
+                return new_params
+        return old_params
 
-            # # 使用回归方式更新V
-            value_loss = torch.nn.functional.mse_loss(decays_return, self._value_func.forward(batched_states).squeeze()) 
-            value_loss.backward()
-
-            writer.add_scalar('value_loss', value_loss, epoch)
-            self._value_optimizer.step()
-
-            # 更新策略网络
-
-            now_estimate_value = self._value_func.forward(batched_states).squeeze()
-            real_weights = decays_return - now_estimate_value.detach()
-
-            # 计算每一个状态对应的Action的概率 
-            batched_action_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1))
-            batched_action_log_prob = torch.log(batched_action_prob)
-
-            # 计算总体的损失，注意这里要加上负号，因为我们要最大化这个值
-            # REIFORCE 还要在梯度前乘以gamma 衰减
-            loss = (-1 * full_gamma_weight_vec * batched_action_log_prob * real_weights).sum()
-            loss.backward()
-
-            writer.add_scalar('policy_target_value', loss, epoch)
-
-            self._optimizer.step() 
 
     def _update_with_trpo(self, trajectory_record_list, writer: SummaryWriter, epoch: int):
         states, actions, rewards, next_states, next_state_ok = zip(*trajectory_record_list)
@@ -557,13 +589,33 @@ class PolicyNetTrainerWithTRPO(PolicyNetTrainer):
         decays_return =batched_rewards.view(1, -1).mm(full_gamma_weight_matrix).squeeze()
 
 
-        old_action_choosed_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1)).suqeeze()
-        old_action_dist = torch.distributions.Categorical(self._policy_func.get_action_distribute(batched_states))
+        # old_action_choosed_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1)).suqeeze()
+        # old_action_dist = torch.distributions.Categorical(self._policy_func.get_action_distribute(batched_states))
 
-        # 由于这里用了简单的FC 作为policy，因此概率比值那一项恒为1.
-        surrogate_obj = torch.mean(decays_return)
-        
+        surrogate_obj = self._compute_surrogate_obj(
+            batched_state=batched_states,
+            batched_action=batched_action_choosed,
+            batched_weights=decays_return,
+            old_policy=self._policy_func,
+            new_policy=self._policy_func
+        )
+        grads = torch.autograd.grad(surrogate_obj, self._policy_func.parameters())
         # 计算此时的梯度向量 g
+        object_grad = torch.cat([grad.view(-1) for grad in grads]).detach()
 
         # 使用共轭梯度计算 x = H^-1 * g
+        descent_dir = self._conjugate_gradient(object_grad, batched_states, self._policy_func, self._policy_func) 
+        hd = self._hessian_vector_product(batched_states, self._policy_func, self._policy_func, descent_dir)
+        max_coef = torch.sqrt(2 * self._kl_threadhold /
+                              (torch.dot(descent_dir, hd) + 1e-8))
+        
+        new_para = self._linear_search(
+            batched_states, 
+            batched_action_choosed, 
+            decays_return, 
+            self._policy_func, 
+            descent_dir * max_coef)
+
+        torch.nn.utils.convert_parameters.vector_to_parameters(new_para, self._policy_func.parameters())
+        
         

@@ -1,5 +1,5 @@
 gymnasium
-gymnasium[box2d]
+# gymnasium[box2d]
 tqdm
 numpy
 matplotlib
