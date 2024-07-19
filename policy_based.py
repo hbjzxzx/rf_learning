@@ -482,42 +482,41 @@ class PolicyNetTrainerWithTRPO(PolicyNetTrainer):
                                batched_state, 
                                batched_action, 
                                batched_weights,
-                               old_policy,
-                               new_policy): 
-        old_log_prob = torch.log(old_policy(batched_state).gather(1, batched_action.view(-1, 1)))
-        new_log_prob = torch.log(new_policy(batched_state).gather(1, batched_action.view(-1, 1)))
+                               old_log_probs): 
+                               
+        log_probs = torch.log(self._policy_func(batched_state).gather(1, batched_action.view(-1, 1)))
         return torch.mean(
-            batched_weights * (old_log_prob - new_log_prob)
+            batched_weights * (log_probs - old_log_probs)
         )
     
     def _hessian_vector_product(self, batched_states, 
-                                old_policy: torch.nn.Module, 
-                                new_policy: torch.nn.Module, 
+                                old_action_dist,
                                 vector: torch.Tensor):
+
         kl_divergence = torch.mean(
             torch.distributions.kl.kl_divergence(
-                torch.distributions.Categorical(old_policy(batched_states)),
-                torch.distributions.Categorical(new_policy(batched_states))
+                torch.distributions.Categorical(self._policy_func.get_action_distribute(batched_states)),
+                old_action_dist
             )
         )
         print('kl_divergence is: ', kl_divergence)
-        kl_grad = torch.autograd.grad(kl_divergence, old_policy.parameters() , create_graph=True)
+        kl_grad = torch.autograd.grad(kl_divergence, self._policy_func.parameters() , create_graph=True)
         kl_grad_vector = torch.cat([grad.view(-1) for grad in kl_grad])
         print('kl_grad_vector is: ', kl_grad_vector)
         kl_grad_vector_product = kl_grad_vector.dot(vector) 
-        grad2 = torch.autograd.grad(kl_grad_vector_product, old_policy.parameters())
+        grad2 = torch.autograd.grad(kl_grad_vector_product, self._policy_func.parameters())
         grad2_vector = torch.cat([grad.view(-1) for grad in grad2])
 
         return grad2_vector
         
-    def _conjugate_gradient(self, grad, state, old_policy, new_policy):
+    def _conjugate_gradient(self, grad, state, old_actions_dist):
         x = torch.zeros_like(grad)
         print('x ini: : ', x)
         r = grad.clone()
         p = grad.clone()
         rdotr = r.dot(r)
         for i in range(10):
-            hp = self._hessian_vector_product(state, old_policy, new_policy, p)
+            hp = self._hessian_vector_product(state, old_actions_dist, p)
             print(f'hp at {i} is: ', hp)
             alpha = rdotr / p.dot(hp)
             x += alpha * p
@@ -532,29 +531,28 @@ class PolicyNetTrainerWithTRPO(PolicyNetTrainer):
         return x
 
 
-    def _linear_search(self, batched_states, batched_action, weights, old_policy: PolicyNetFunc, descent_dir):
-        old_obj = self._compute_surrogate_obj(batched_states, batched_action, weights, old_policy, old_policy)
-        old_params = torch.nn.utils.convert_parameters.parameters_to_vector(old_policy.parameters())
+    def _linear_search(self, batched_states, batched_action, weights, old_log_prob, old_action_dists, descent_dir):
+        old_obj = self._compute_surrogate_obj(batched_states, batched_action, weights, old_log_prob)
+        old_params = torch.nn.utils.convert_parameters.parameters_to_vector(self._policy_func.parameters())
                 
         for i in range(15):
             coef = self._search_alpha ** i
             new_params = old_params + coef * descent_dir
-            new_actor = copy.deepcopy(old_policy)
+            new_actor = copy.deepcopy(self._policy_func)
             torch.nn.utils.convert_parameters.vector_to_parameters(new_params, new_actor.parameters())
             print('coef is: ', coef)
             print('descent is: ', descent_dir)
             x = new_actor.get_action_distribute(batched_states)
-            print(x)
-            y = old_policy.get_action_distribute(batched_states)
-            print('y is: ', y)
+
             new_action_dist = torch.distributions.Categorical(x)
+
             kl_divergence = torch.mean(
                 torch.distributions.kl.kl_divergence(
-                    torch.distributions.Categorical(old_policy(batched_states)),
+                    old_action_dists,
                     new_action_dist
                 )
             )
-            new_obj = self._compute_surrogate_obj(batched_states, batched_action, weights, old_policy, new_actor)
+            new_obj = self._compute_surrogate_obj(batched_states, batched_action, weights, old_log_prob)
             if new_obj > old_obj and kl_divergence < self._kl_threadhold:
                 return new_params
         return old_params
@@ -589,23 +587,24 @@ class PolicyNetTrainerWithTRPO(PolicyNetTrainer):
         decays_return =batched_rewards.view(1, -1).mm(full_gamma_weight_matrix).squeeze()
 
 
-        # old_action_choosed_prob = self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1)).suqeeze()
-        # old_action_dist = torch.distributions.Categorical(self._policy_func.get_action_distribute(batched_states))
+        old_log_probs = torch.log(
+            self._policy_func.get_action_distribute(batched_states).gather(1, batched_action_choosed.unsqueeze(1)).suqeeze().detach()
+        )
+        old_action_dists = torch.distributions.Categorical(self._policy_func.get_action_distribute(batched_states)).detach()
 
         surrogate_obj = self._compute_surrogate_obj(
             batched_state=batched_states,
             batched_action=batched_action_choosed,
             batched_weights=decays_return,
-            old_policy=self._policy_func,
-            new_policy=self._policy_func
+            old_log_probs=old_log_probs
         )
         grads = torch.autograd.grad(surrogate_obj, self._policy_func.parameters())
         # 计算此时的梯度向量 g
         object_grad = torch.cat([grad.view(-1) for grad in grads]).detach()
 
         # 使用共轭梯度计算 x = H^-1 * g
-        descent_dir = self._conjugate_gradient(object_grad, batched_states, self._policy_func, self._policy_func) 
-        hd = self._hessian_vector_product(batched_states, self._policy_func, self._policy_func, descent_dir)
+        descent_dir = self._conjugate_gradient(object_grad, batched_states, old_action_dists) 
+        hd = self._hessian_vector_product(batched_states, old_action_dists, descent_dir)
         max_coef = torch.sqrt(2 * self._kl_threadhold /
                               (torch.dot(descent_dir, hd) + 1e-8))
         

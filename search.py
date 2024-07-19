@@ -114,4 +114,8 @@ if __name__ == '__main__':
     # 使用组合剪枝器
     pruner = CombinedPruner(custom_threshold=80)
     study = optuna.create_study(direction='maximize', pruner=pruner, storage='sqlite:///example_study.db')
+<<<<<<< HEAD
     study.optimize(objective, n_trials=100, n_jobs=4)
+=======
+    study.optimize(objective, n_trials=100, n_jobs=1)
+>>>>>>> 89a23f3 (mmit -m mmi)
